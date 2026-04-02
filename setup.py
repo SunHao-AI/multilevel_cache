@@ -11,7 +11,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="multilevel-cache",
-    version="1.0.0",
+    version="1.1.0",
     author="SunHao",
     author_email="2865467769@qq.com",
     description="一个可复用的多级缓存Python模块，支持L1内存缓存、L2 Redis缓存和L3数据库回源",
