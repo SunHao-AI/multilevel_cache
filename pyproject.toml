@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multilevel-cache"
-version = "1.1.0"
+version = "1.1.1"
 description = "一个可复用的多级缓存Python模块，支持L1内存缓存、L2 Redis缓存和L3数据库回源"
 readme = "README.md"
 license = {text = "MIT"}
@@ -25,7 +25,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: System :: Caching",
 ]
 dependencies = [
     "redis>=5.0.0",
@@ -43,10 +42,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/multilevel-cache"
-Documentation = "https://github.com/yourusername/multilevel-cache#readme"
-Repository = "https://github.com/yourusername/multilevel-cache.git"
-Issues = "https://github.com/yourusername/multilevel-cache/issues"
+Homepage = "https://github.com/SunHao-AI/multilevel_cache"
+Documentation = "https://github.com/SunHao-AI/multilevel_cache#readme"
+Repository = "https://github.com/SunHao-AI/multilevel_cache.git"
+Issues = "https://github.com/SunHao-AI/multilevel_cache/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

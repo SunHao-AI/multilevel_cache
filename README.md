@@ -31,22 +31,22 @@ pip install multilevel-cache
 
 ```bash
 # 直接从 Git 仓库安装
-pip install git+https://github.com/yourusername/multilevel-cache.git
+pip install git+https://github.com/SunHao-AI/multilevel_cache.git
 
 # 或安装特定分支/标签
-pip install git+https://github.com/yourusername/multilevel-cache.git@main
-pip install git+https://github.com/yourusername/multilevel-cache.git@v1.1.0
+pip install git+https://github.com/SunHao-AI/multilevel_cache.git@main
+pip install git+https://github.com/SunHao-AI/multilevel_cache.git@v1.1.0
 
 # 使用 SSH 方式安装（适用于私有仓库）
-pip install git+ssh://git@github.com/yourusername/multilevel-cache.git
+pip install git+ssh://git@github.com/SunHao-AI/multilevel_cache.git
 ```
 
 ### 方式三：从源码安装（开发模式）
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/multilevel-cache.git
-cd multilevel-cache
+git clone https://github.com/SunHao-AI/multilevel_cache.git
+cd multilevel_cache
 
 # 安装开发依赖
 pip install -e ".[dev]"
