@@ -2,10 +2,14 @@
 缓存装饰器模块 - 提供便捷的缓存装饰器
 """
 
+import asyncio
 import functools
 import hashlib
 import json
 import logging
+import threading
+import time
+import weakref
 from typing import Any, Callable, Optional, Union
 
 logger = logging.getLogger(__name__)
@@ -40,8 +44,6 @@ def cached(
     key_prefix: str = "",
     ttl: Optional[int] = None,
     key_builder: Optional[Callable] = None,
-    prevent_penetration: bool = True,
-    prevent_breakdown: bool = True,
 ):
     """
     同步缓存装饰器
@@ -51,8 +53,11 @@ def cached(
         key_prefix: 缓存键前缀
         ttl: 过期时间（秒）
         key_builder: 自定义缓存键构建函数
-        prevent_penetration: 是否防止缓存穿透
-        prevent_breakdown: 是否防止缓存击穿
+    
+    MLC-07: 原有的 prevent_penetration / prevent_breakdown 参数收下后从未
+    传递下游（死参数），已删除。穿透/击穿防护现由 CacheManager.get 主链路
+    统一实施（空值哨兵 + 按 key single-flight），由 CacheConfig 的
+    protection_config 控制。
     
     Example:
         @cached(key_prefix="user", ttl=300)
@@ -112,6 +117,11 @@ def _invalidate(
     return cache_manager.delete(cache_key)
 
 
+# MLC-07: cached_async 的按 key in-flight 表（事件循环单线程内 get/pop 之间
+# 无 await，天然原子；跨任务共享 Future 实现同键并发只回源一次）
+_async_inflight: dict = {}
+
+
 def cached_async(
     cache_manager=None,
     key_prefix: str = "",
@@ -126,6 +136,9 @@ def cached_async(
         key_prefix: 缓存键前缀
         ttl: 过期时间（秒）
         key_builder: 自定义缓存键构建函数
+    
+    MLC-07: 原实现为无锁 check-then-set，热点键过期瞬间全部协程并发回源
+    （惊群）。现按 key 共享 in-flight Future，同键并发仅一个协程执行函数。
     
     Example:
         @cached_async(key_prefix="user", ttl=300)
@@ -150,11 +163,25 @@ def cached_async(
             if cached_value is not None:
                 return cached_value
             
-            result = await func(*args, **kwargs)
+            pending = _async_inflight.get(cache_key)
+            if pending is not None:
+                return await asyncio.shield(pending)
             
-            cache_manager.set(cache_key, result, ttl=ttl)
-            
-            return result
+            loop = asyncio.get_event_loop()
+            fut = loop.create_future()
+            _async_inflight[cache_key] = fut
+            try:
+                result = await func(*args, **kwargs)
+                cache_manager.set(cache_key, result, ttl=ttl)
+                if not fut.done():
+                    fut.set_result(result)
+                return result
+            except BaseException as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+                raise
+            finally:
+                _async_inflight.pop(cache_key, None)
         
         wrapper.cache_invalidate = lambda *args, **kwargs: _invalidate(
             cache_manager, key_prefix, func, args, kwargs, key_builder
@@ -301,6 +328,11 @@ class CachedProperty:
     
     类似于functools.cached_property，但支持TTL
     
+    MLC-06: 原实现用 `id(instance)` 拼缓存键写入共享 CacheManager。CPython
+    会复用已释放对象的内存地址 —— 旧实例被 GC 后，新实例命中旧实例的缓存值
+    （且跨类也可能撞 id）。改为每个描述符自持 WeakKeyDictionary：随实例
+    销毁自动淘汰，无 id 复用风险，也不会把对象图写进共享 L1/L2。
+    
     Example:
         class User:
             @CachedProperty(ttl=300)
@@ -312,6 +344,9 @@ class CachedProperty:
         self.func = func
         self.ttl = ttl
         self.attr_name = None
+        # instance -> (value, expire_at); 弱键，实例销毁即释放
+        self._values = weakref.WeakKeyDictionary()
+        self._lock = threading.Lock()
     
     def __set_name__(self, owner, name):
         self.attr_name = f"_cached_{name}"
@@ -320,23 +355,28 @@ class CachedProperty:
         if instance is None:
             return self
         
-        if self.attr_name is None:
-            self.attr_name = f"_cached_{self.func.__name__}"
+        if self.func is None:
+            raise AttributeError(
+                "CachedProperty 尚未绑定函数，请检查装饰器用法"
+            )
         
-        cache_manager = getattr(instance, '_cache_manager', None)
-        if cache_manager is None:
-            from multilevel_cache.core import CacheManager
-            cache_manager = CacheManager.get_instance()
-        
-        cache_key = f"{instance.__class__.__name__}:{id(instance)}:{self.func.__name__}"
-        
-        cached_value = cache_manager.get(cache_key)
-        if cached_value is not None:
-            return cached_value
+        now = time.time()
+        try:
+            with self._lock:
+                entry = self._values.get(instance)
+                if entry is not None and entry[1] > now:
+                    return entry[0]
+        except TypeError:
+            # 实例不可弱引用/不可哈希（如带 __slots__ 的类）：放弃缓存
+            return self.func(instance)
         
         result = self.func(instance)
-        cache_manager.set(cache_key, result, ttl=self.ttl)
         
+        try:
+            with self._lock:
+                self._values[instance] = (result, now + self.ttl)
+        except TypeError:
+            pass
         return result
     
     def __call__(self, func: Callable):

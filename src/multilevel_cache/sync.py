@@ -13,6 +13,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Union
 
+# MLC-03: pika 必须在模块级导入。此前仅在 _init_connection() 内 import，
+# publish() 里引用的 pika.BasicProperties 处于函数作用域之外，必然抛
+# NameError 并被 except Exception 吞掉 —— 表现为发布永远静默失败。
+try:
+    import pika
+except ImportError:  # MQ 为可选依赖
+    pika = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +73,10 @@ class MQConfig:
     password: str = "guest"
     virtual_host: str = "/"
     exchange: str = "cache_sync"
-    exchange_type: str = "topic"
+    # MLC-03: 缓存失效必须广播给每个节点。默认 fanout + 每消费者独占队列；
+    # 若沿用固定 queue_name，多个节点是竞争消费，一条失效消息只会让一个节点
+    # 清理本地缓存，其余节点的 L1/L2 长期脏读。
+    exchange_type: str = "fanout"
     routing_key: str = "cache.invalidation"
     queue_name: str = "cache_sync_queue"
     
@@ -102,19 +113,35 @@ class MQPublisher:
         self._available = False
         self._failure_count = 0
         self._lock = threading.Lock()
-        
-        self._init_connection()
+        # MLC-13: 构造不再同步建连——实例化即连 MQ 会让"默认开启但环境无 MQ"
+        # 的部署在 import/启动期就吃连接超时。连接改为首次实际使用时懒建。
+        self._init_attempted = False
+
+    def _ensure_connection(self) -> bool:
+        """MLC-13: 懒建连接。失败后不每次 publish 都重试(保持与旧行为一致的单次尝试)，
+        但连接断开可由 publish 失败路径显式触发重连。"""
+        if self._available:
+            return True
+        with self._lock:
+            if self._available:
+                return True
+            if self._init_attempted:
+                return False
+            self._init_attempted = True
+            self._init_connection()
+            return self._available
     
     def _init_connection(self) -> None:
         """初始化连接"""
         try:
-            import pika
-            
+            if pika is None:
+                raise ImportError("pika")
+
             credentials = pika.PlainCredentials(
                 self.config.user,
                 self.config.password
             )
-            
+
             self._connection = pika.BlockingConnection(
                 pika.ConnectionParameters(
                     host=self.config.host,
@@ -148,7 +175,9 @@ class MQPublisher:
     
     @property
     def is_available(self) -> bool:
-        """检查MQ是否可用"""
+        """检查MQ是否可用（MLC-13: 未连接时触发一次懒建）"""
+        if not self._available:
+            self._ensure_connection()
         return self._available
     
     def publish(
@@ -166,6 +195,9 @@ class MQPublisher:
         Returns:
             是否发布成功
         """
+        # MLC-13: 首次发布时懒建连接；建连失败过则走恢复检查
+        if not self._available:
+            self._ensure_connection()
         if not self._available:
             self._check_recovery()
             if not self._available:
@@ -276,7 +308,16 @@ class MQConsumer:
         self,
         config: MQConfig = None,
         cache_manager = None,
+        version_store = None,
     ):
+        """
+        Args:
+            config: MQ 配置
+            cache_manager: 缓存管理器（用于执行本地失效）
+            version_store: MLC-12 可选的分布式版本存储（需实现 get(key)/set(key, value)）。
+                不传时版本仅存本进程内存——多 worker 部署下各节点版本互不可见，
+                乱序消息去重只在单进程内成立。
+        """
         self.config = config or MQConfig()
         self.cache_manager = cache_manager
         self._connection = None
@@ -284,9 +325,38 @@ class MQConsumer:
         self._available = False
         self._running = False
         self._consumer_thread = None
+        # MLC-03: fanout 模式下为服务端分配的独占队列名；非 fanout 时回落固定名
+        self._queue_name = self.config.queue_name
         
         self._handlers: Dict[str, Callable] = {}
+        # MLC-12: 内存映射降级为"读缓存"，权威值在 version_store（若提供）
+        self._version_store = version_store
         self._version_map: Dict[int, int] = {}
+
+    def _version_key(self, config_id) -> str:
+        return f"mlc:mq_version:{config_id}"
+
+    def _get_last_version(self, config_id) -> int:
+        """读取某 config 的最近已处理版本（MLC-12: 优先分布式存储，内存作缓存）"""
+        if self._version_store is not None:
+            try:
+                stored = self._version_store.get(self._version_key(config_id))
+                if stored is not None:
+                    version = int(stored)
+                    self._version_map[config_id] = version
+                    return version
+            except Exception as e:
+                logger.warning(f"读取分布式版本失败, 回落内存: {e}")
+        return self._version_map.get(config_id, 0)
+
+    def _set_last_version(self, config_id, version: int) -> None:
+        """记录已处理版本（MLC-12: 内存 + 可选分布式存储双写）"""
+        self._version_map[config_id] = version
+        if self._version_store is not None:
+            try:
+                self._version_store.set(self._version_key(config_id), version)
+            except Exception as e:
+                logger.warning(f"写入分布式版本失败, 仅内存生效: {e}")
     
     def register_handler(
         self,
@@ -299,13 +369,14 @@ class MQConsumer:
     def _init_connection(self) -> bool:
         """初始化连接"""
         try:
-            import pika
-            
+            if pika is None:
+                raise ImportError("pika")
+
             credentials = pika.PlainCredentials(
                 self.config.user,
                 self.config.password
             )
-            
+
             self._connection = pika.BlockingConnection(
                 pika.ConnectionParameters(
                     host=self.config.host,
@@ -317,28 +388,43 @@ class MQConsumer:
                     heartbeat=self.config.heartbeat,
                 )
             )
-            
+
             self._channel = self._connection.channel()
-            
+
             self._channel.exchange_declare(
                 exchange=self.config.exchange,
                 exchange_type=self.config.exchange_type,
                 durable=True
             )
-            
-            result = self._channel.queue_declare(
-                queue=self.config.queue_name,
-                durable=True
-            )
-            
-            self._channel.queue_bind(
-                queue=self.config.queue_name,
-                exchange=self.config.exchange,
-                routing_key=self.config.routing_key
-            )
-            
+
+            # MLC-03: fanout 下每个节点必须持有自己的队列才能收到全量广播。
+            # 使用 server-named + exclusive + auto_delete：连接断开即自动清理，
+            # 避免节点重启遗留孤儿队列堆积消息。仅当显式配置了非 fanout
+            # 交换机(兼容旧部署)时才沿用固定 queue_name。
+            if self.config.exchange_type == "fanout":
+                result = self._channel.queue_declare(
+                    queue="",
+                    exclusive=True,
+                    auto_delete=True,
+                )
+                self._queue_name = result.method.queue
+                self._channel.queue_bind(
+                    queue=self._queue_name,
+                    exchange=self.config.exchange,
+                )
+            else:
+                self._channel.queue_declare(
+                    queue=self.config.queue_name,
+                    durable=True
+                )
+                self._channel.queue_bind(
+                    queue=self.config.queue_name,
+                    exchange=self.config.exchange,
+                    routing_key=self.config.routing_key
+                )
+
             self._available = True
-            logger.info(f"MQ消费者初始化成功: {self.config.queue_name}")
+            logger.info(f"MQ消费者初始化成功: {self._queue_name}")
             return True
             
         except Exception as e:
@@ -352,13 +438,14 @@ class MQConsumer:
             message = CacheSyncMessage.from_json(body.decode())
             
             if message.config_id and message.version:
-                last_version = self._version_map.get(message.config_id, 0)
+                # MLC-12: 经 _get_last_version 读权威版本（分布式存储优先）
+                last_version = self._get_last_version(message.config_id)
                 if message.version <= last_version:
                     logger.debug(f"忽略过期消息: {message.message_id}")
                     channel.basic_ack(delivery_tag=method.delivery_tag)
                     return
                 
-                self._version_map[message.config_id] = message.version
+                self._set_last_version(message.config_id, message.version)
             
             handler = self._handlers.get(message.message_type)
             if handler:
@@ -399,7 +486,7 @@ class MQConsumer:
         
         self._channel.basic_qos(prefetch_count=1)
         self._channel.basic_consume(
-            queue=self.config.queue_name,
+            queue=self._queue_name,
             on_message_callback=self._on_message
         )
         
@@ -446,10 +533,13 @@ class CacheSyncManager:
         mq_config: MQConfig = None,
         cache_manager = None,
         enable_sync: bool = True,
+        version_store = None,
     ):
         self.mq_config = mq_config or MQConfig()
         self.cache_manager = cache_manager
         self.enable_sync = enable_sync
+        # MLC-12: 分布式版本存储透传给消费者
+        self._version_store = version_store
         
         self._publisher: Optional[MQPublisher] = None
         self._consumer: Optional[MQConsumer] = None
@@ -464,7 +554,7 @@ class CacheSyncManager:
         self._mq_available = self._publisher.is_available
         
         if self.cache_manager:
-            self._consumer = MQConsumer(self.mq_config, self.cache_manager)
+            self._consumer = MQConsumer(self.mq_config, self.cache_manager, version_store=self._version_store)
     
     @property
     def is_available(self) -> bool:

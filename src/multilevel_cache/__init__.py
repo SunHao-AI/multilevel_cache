@@ -76,7 +76,7 @@ from multilevel_cache.integrated import (
     IntegratedCacheConfig,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __all__ = [
     # 核心组件
     "CacheBackend",

@@ -2,10 +2,24 @@
 配置模块 - 定义缓存配置、策略和枚举
 """
 
+import logging
 import os
 from enum import Enum
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Set
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+def _warn_unknown_keys(section: str, data: Dict[str, Any], known: Set[str]) -> None:
+    """MLC-05: 对配置段的未知键告警，拼写错误(如 socket_connect_connect_timeout)
+    过去会静默丢失或抛出难定位的 TypeError"""
+    unknown = set(data) - known
+    if unknown:
+        logger.warning(
+            f"CacheConfig 段 '{section}' 含未知键并被忽略: {sorted(unknown)}; "
+            f"已知键: {sorted(known)}"
+        )
 
 
 class CacheLevel(Enum):
@@ -148,6 +162,10 @@ class CacheConfig:
         
         if "memory" in data:
             mc = data["memory"]
+            _warn_unknown_keys(
+                "memory", mc,
+                {"max_size", "default_ttl", "eviction_policy", "thread_safe"},
+            )
             config.memory_config = MemoryCacheConfig(
                 max_size=mc.get("max_size", 1000),
                 default_ttl=mc.get("default_ttl", 300),
@@ -157,6 +175,11 @@ class CacheConfig:
         
         if "redis" in data:
             rc = data["redis"]
+            _warn_unknown_keys(
+                "redis", rc,
+                {"host", "port", "db", "password", "ssl", "socket_timeout",
+                 "socket_connect_timeout", "max_connections", "decode_responses"},
+            )
             config.redis_config = RedisConfig(
                 host=rc.get("host", "localhost"),
                 port=rc.get("port", 6379),
@@ -164,13 +187,20 @@ class CacheConfig:
                 password=rc.get("password"),
                 ssl=rc.get("ssl", False),
                 socket_timeout=rc.get("socket_timeout", 5),
-                socket_connect_connect_timeout=rc.get("socket_connect_timeout", 5),
+                # MLC-05: 原为 socket_connect_connect_timeout（拼写错误），
+                # dataclass 不接收未知字段，配置了 redis 段必然 TypeError
+                socket_connect_timeout=rc.get("socket_connect_timeout", 5),
                 max_connections=rc.get("max_connections", 50),
                 decode_responses=rc.get("decode_responses", True),
             )
         
         if "ttl" in data:
             tc = data["ttl"]
+            _warn_unknown_keys(
+                "ttl", tc,
+                {"default", "l1_ttl", "l2_ttl", "null_value_ttl",
+                 "lock_timeout", "jitter_min", "jitter_max"},
+            )
             config.ttl_config = TTLConfig(
                 default=tc.get("default", 300),
                 l1_ttl=tc.get("l1_ttl", 300),
@@ -200,6 +230,9 @@ class CacheConfig:
                 failure_threshold=dc.get("failure_threshold", 3),
                 recovery_check_interval=dc.get("recovery_check_interval", 30),
                 enable_l2_fallback=dc.get("enable_l2_fallback", True),
+                # MLC-05: 原先漏传该字段，配置文件里的 quick_degradation_window
+                # 静默丢弃，快速降级窗口永远是默认 60s
+                quick_degradation_window=dc.get("quick_degradation_window", 60),
             )
         
         config.enable_metrics = data.get("enable_metrics", True)

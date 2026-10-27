@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from multilevel_cache.config import (
     CacheConfig,
+    DegradationConfig,
     MemoryCacheConfig,
     RedisConfig,
     TTLConfig,
@@ -94,7 +95,9 @@ class MemoryCache(CacheBackend):
         return time.time()
     
     def _is_expired(self, entry: CacheEntry) -> bool:
-        return self._now() > entry.expire_at
+        # MLC-08: 用 >= 使 ttl=0 语义为"写入即过期"。Windows time.time()
+        # 精度约 1-15ms，`>` 在同一时钟刻度内 set→get 会误判未过期。
+        return self._now() >= entry.expire_at
     
     def _evict(self) -> None:
         """执行淘汰策略"""
@@ -386,9 +389,19 @@ class RedisCache(CacheBackend):
         }
     
     def _serialize(self, value: Any) -> Union[str, bytes]:
-        """序列化值"""
-        if isinstance(value, (str, int, float, bool)):
-            return str(value)
+        """
+        序列化值（MLC-09: 全类型走 JSON 文本，保证读取端 json.loads 类型还原）
+        
+        - str 存带引号的 JSON 字符串（'"123"'），取回仍是 str，不再被
+          json.loads 改写为 int/bool；
+        - bool 必须 json.dumps（str(True)='True' 非法 JSON，取回会变字符串）；
+        - int/float 文本本身就是合法 JSON，读取端原类型还原；
+        - 旧格式裸存的 "123" 读到 int 属已知遗留漂移，新写入不再有类型问题。
+        """
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, (bool, int, float)):
+            return json.dumps(value)
         try:
             return json.dumps(value, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
@@ -407,6 +420,7 @@ class RedisCache(CacheBackend):
             try:
                 return json.loads(value)
             except (json.JSONDecodeError, TypeError):
+                # 旧格式裸存的非 JSON 文本(如 'hello')走此分支，原样返回
                 return value
         return value
     
@@ -579,6 +593,11 @@ class RedisCache(CacheBackend):
             if not self._available:
                 return False
         
+        # MLC-08: ttl<=0 语义为"立即过期"，Redis EX 0 会报 invalid expire time
+        # 并触发误降级，直接不写入
+        if ttl is not None and ttl <= 0:
+            return False
+        
         try:
             with self._get_connection() as conn:
                 serialized = self._serialize(value)
@@ -647,27 +666,46 @@ class RedisCache(CacheBackend):
         except Exception:
             return False
     
-    def clear(self) -> None:
-        """清空当前数据库"""
+    def clear(self, patterns: Optional[List[str]] = None) -> int:
+        """
+        按模式清空缓存键（SCAN 游标迭代删除）
+
+        历史实现为 FLUSHDB：会无差别清空整个 Redis DB，
+        与业务键（分布式锁/账本/黑名单等非缓存键）同库部署时将连带删除它们，
+        属数据破坏级副作用，故改为 SCAN + 批量 DELETE。
+
+        :param patterns: 键匹配模式列表；None 时按 ["*"] 处理（调用方应显式
+            传入自身的缓存命名空间模式，避免误删同库的非缓存键）
+        :return: 删除的键数量
+        """
         if self._quick_degradation_mode:
             elapsed = time.time() - self._degradation_start_time
             if elapsed <= self.degradation_config.quick_degradation_window:
                 logger.debug(f"Redis快速降级模式，跳过CLEAR操作")
-                return
+                return 0
             else:
                 self._quick_degradation_mode = False
                 self._failure_count = 0
                 logger.info(f"Redis快速降级窗口过期，恢复正常检查模式")
-        
+
         if not self._available:
-            return
-        
+            return 0
+
+        deleted = 0
         try:
             with self._get_connection() as conn:
-                conn.flushdb()
+                for pattern in (patterns or ["*"]):
+                    cursor = 0
+                    while True:
+                        cursor, keys = conn.scan(cursor=cursor, match=pattern, count=500)
+                        if keys:
+                            deleted += conn.delete(*keys)
+                        if cursor == 0:
+                            break
                 self._failure_count = 0
         except Exception as e:
-            self._handle_error(e, "FLUSHDB")
+            self._handle_error(e, "CLEAR")
+        return deleted
     
     def get_stats(self) -> Dict[str, Any]:
         """获取缓存统计"""
@@ -716,9 +754,11 @@ class RedisCache(CacheBackend):
         if not self._available:
             return []
         
+        # MLC-11: KEYS 会阻塞 Redis 主线程数秒(共库的业务锁/账本全部卡死),
+        # 改 SCAN 游标迭代——单次 O(count), 对同实例其他客户端可穿插响应
         try:
             with self._get_connection() as conn:
-                result = conn.keys(pattern)
+                result = list(conn.scan_iter(match=pattern, count=500))
                 return [k.decode('utf-8') if isinstance(k, bytes) else k for k in result]
         except Exception as e:
             self._handle_error(e, "KEYS")
@@ -739,12 +779,22 @@ class RedisCache(CacheBackend):
         keys = self.keys(pattern)
         if not keys:
             return 0
-        
+
         try:
             with self._get_connection() as conn:
-                result = conn.delete(*keys)
+                # MLC-11: 分批删除, 避免单次 DEL 携带 10 万 member 阻塞主线程;
+                # 优先 UNLINK(服务端后台异步回收), 旧版本服务端回落 DEL
+                deleted = 0
+                batch = 1000
+                use_unlink = hasattr(conn, "unlink")
+                for i in range(0, len(keys), batch):
+                    chunk = keys[i:i + batch]
+                    if use_unlink:
+                        deleted += conn.unlink(*chunk)
+                    else:
+                        deleted += conn.delete(*chunk)
                 self._failure_count = 0
-                return result
+                return deleted
         except Exception as e:
             self._handle_error(e, "DELETE_PATTERN")
             return 0
@@ -891,6 +941,19 @@ class MultiLevelCache:
     支持 L1(内存) -> L2(Redis) -> L3(数据库) 三级缓存架构
     """
     
+    # MLC-08: 公开哨兵常量，配合 get(sentinel_as=...) 供调用方区分
+    # "缓存了空值" 与 "未命中"
+    NULL_SENTINEL = "__NULL__"
+    
+    class _InflightEntry:
+        """MLC-07: single-flight 条目——同 key 并发回源仅一个 loader 执行"""
+        __slots__ = ("event", "value", "failed")
+        
+        def __init__(self):
+            self.event = threading.Event()
+            self.value: Any = None
+            self.failed = False
+    
     def __init__(self, config: CacheConfig = None):
         self.config = config or CacheConfig()
         
@@ -905,6 +968,11 @@ class MultiLevelCache:
                 )
             except Exception as e:
                 logger.warning(f"Redis初始化失败，将仅使用L1缓存: {str(e)}")
+        
+        # MLC-07: 按 key 的 single-flight 注册表（击穿保护主链路接入，
+        # 此前 enable_breakdown_protection 配置项从未生效）
+        self._inflight: Dict[str, "MultiLevelCache._InflightEntry"] = {}
+        self._inflight_lock = threading.Lock()
         
         self._enabled = True
         self._metrics = {
@@ -927,11 +995,78 @@ class MultiLevelCache:
         """获取L2缓存"""
         return self._l2_cache
     
+    def _lookup(self, key: str) -> Any:
+        """查 L1/L2。返回 (value, hit)；哨兵以原始值返回，不做 None 翻译。"""
+        value = self._l1_cache.get(key)
+        if value is not None:
+            self._metrics["l1_hits"] += 1
+            return value, True
+        
+        self._metrics["l1_misses"] += 1
+        
+        if self._l2_cache and self._l2_cache.is_available:
+            value = self._l2_cache.get(key)
+            if value is not None:
+                self._metrics["l2_hits"] += 1
+                self._l1_cache.set(key, value, self.config.ttl_config.l1_ttl)
+                return value, True
+        
+        self._metrics["l2_misses"] += 1
+        return None, False
+    
+    def _load_with_single_flight(
+        self,
+        key: str,
+        loader: Callable[[], Any],
+        actual_ttl: int,
+    ) -> Any:
+        """
+        MLC-07: 按 key single-flight 回源。
+        
+        热点键过期瞬间，只有第一个线程执行 loader，其余线程等待并共享结果，
+        避免击穿(惊群)打穿到 L3。loader 抛异常时不写缓存，等待方原样获得 False
+        语义后自行再回源（不吞异常类型，统一以失败处理、不误缓存脏值）。
+        """
+        with self._inflight_lock:
+            entry = self._inflight.get(key)
+            is_leader = entry is None
+            if is_leader:
+                entry = self._InflightEntry()
+                self._inflight[key] = entry
+        
+        if not is_leader:
+            entry.event.wait()
+            if entry.failed:
+                # 领头失败：本线程直接回源一次（不递归 single-flight）
+                return loader()
+            return entry.value
+        
+        try:
+            value = loader()
+            self._metrics["l3_hits"] += 1
+            
+            if value is None and self.config.protection_config.enable_penetration_protection:
+                self._set_cache(key, self.NULL_SENTINEL, self.config.ttl_config.null_value_ttl)
+            elif value is not None:
+                self._set_cache(key, value, actual_ttl)
+            
+            entry.value = value
+        except BaseException:
+            entry.failed = True
+            raise
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(key, None)
+            entry.event.set()
+        
+        return entry.value
+    
     def get(
         self,
         key: str,
         loader: Optional[Callable[[], Any]] = None,
         ttl: Optional[int] = None,
+        sentinel_as: Any = None,
     ) -> Optional[Any]:
         """
         多级缓存获取
@@ -939,7 +1074,11 @@ class MultiLevelCache:
         Args:
             key: 缓存键
             loader: 数据加载函数(L3回源)
-            ttl: 过期时间
+            ttl: 过期时间；显式传 0 表示不过期语义由下层处理，
+                 MLC-08: 不再被 `ttl or default` 的 falsy 判断吞掉
+            sentinel_as: MLC-08: 命中空值哨兵时的返回值。默认 None 保持
+                 向后兼容；调用方可传入专用标记(如哨兵常量本身)以区分
+                 "缓存了空值"与"未命中"
         
         Returns:
             缓存值或None
@@ -950,33 +1089,21 @@ class MultiLevelCache:
             return None
         
         self._metrics["total_requests"] += 1
-        actual_ttl = ttl or self.config.ttl_config.default
+        # MLC-08: 显式判 None，ttl=0 不再回落默认值
+        actual_ttl = self.config.ttl_config.default if ttl is None else ttl
         
-        value = self._l1_cache.get(key)
-        if value is not None:
-            self._metrics["l1_hits"] += 1
-            return value if value != "__NULL__" else None
-        
-        self._metrics["l1_misses"] += 1
-        
-        if self._l2_cache and self._l2_cache.is_available:
-            value = self._l2_cache.get(key)
-            if value is not None:
-                self._metrics["l2_hits"] += 1
-                self._l1_cache.set(key, value, self.config.ttl_config.l1_ttl)
-                return value if value != "__NULL__" else None
-        
-        self._metrics["l2_misses"] += 1
+        value, hit = self._lookup(key)
+        if hit:
+            if value == self.NULL_SENTINEL:
+                return self.NULL_SENTINEL if sentinel_as is self.NULL_SENTINEL else sentinel_as
+            return value
         
         if loader:
-            value = loader()
-            self._metrics["l3_hits"] += 1
-            
+            value = self._load_with_single_flight(key, loader, actual_ttl)
+            # 回源结果为 None 且启用了防穿透时同样应用 sentinel_as 语义，
+            # 使调用方能区分"DB 就是空"与"未启用防穿透的 None"
             if value is None and self.config.protection_config.enable_penetration_protection:
-                self._set_cache(key, "__NULL__", self.config.ttl_config.null_value_ttl)
-            elif value is not None:
-                self._set_cache(key, value, actual_ttl)
-            
+                return self.NULL_SENTINEL if sentinel_as is self.NULL_SENTINEL else sentinel_as
             return value
         
         self._metrics["l3_misses"] += 1
@@ -988,22 +1115,28 @@ class MultiLevelCache:
         self._l1_cache.set(key, value, l1_ttl)
         
         if self._l2_cache and self._l2_cache.is_available:
-            l2_ttl = self.config.ttl_config.get_ttl_with_jitter(ttl)
+            # MLC-10: l2_ttl 此前为死配置(写入 L2 从不读取)。现接入为 L2 TTL 上限,
+            # 与 l1_ttl 对 L1 的 clamp 语义对称: 实际 TTL = min(写入ttl, l2_ttl) 后加抖动
+            l2_base = min(ttl, self.config.ttl_config.l2_ttl) if self.config.ttl_config.l2_ttl > 0 else ttl
+            l2_ttl = self.config.ttl_config.get_ttl_with_jitter(l2_base)
             self._l2_cache.set(key, value, l2_ttl)
     
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """设置缓存"""
-        actual_ttl = ttl or self.config.ttl_config.default
+        # MLC-08: 显式判 None，ttl=0 不再被 falsy 吞成默认 TTL
+        actual_ttl = self.config.ttl_config.default if ttl is None else ttl
         self._set_cache(key, value, actual_ttl)
         return True
     
     def delete(self, key: str) -> bool:
         """删除缓存"""
-        self._l1_cache.delete(key)
-        
+        # 顺序必须 L2 → L1: 若先删 L1, 并发读会在"L2 仍为旧值"的窗口里
+        # 用旧 L2 值回填 L1, 脏值驻留至 L1 TTL 到期
         if self._l2_cache:
             self._l2_cache.delete(key)
-        
+
+        self._l1_cache.delete(key)
+
         return True
     
     def delete_pattern(self, pattern: str) -> int:
@@ -1021,12 +1154,22 @@ class MultiLevelCache:
         
         return count
     
-    def clear(self) -> None:
-        """清空所有缓存"""
+    def clear(self, patterns: Optional[List[str]] = None) -> int:
+        """
+        清空缓存
+
+        L1 直接清空；L2 按模式 SCAN 删除（不再 FLUSHDB 全库，避免误删同库
+        非缓存键）。调用方应显式传入自身缓存命名空间模式集合。
+
+        :param patterns: L2 键匹配模式列表，None 时按 ["*"] 处理
+        :return: L2 删除的键数量
+        """
         self._l1_cache.clear()
-        
+
+        deleted = 0
         if self._l2_cache:
-            self._l2_cache.clear()
+            deleted = self._l2_cache.clear(patterns or ["*"])
+        return deleted
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -1092,9 +1235,10 @@ class CacheManager:
         key: str,
         loader: Optional[Callable[[], Any]] = None,
         ttl: Optional[int] = None,
+        sentinel_as: Any = None,
     ) -> Optional[Any]:
-        """获取缓存"""
-        return self._cache.get(key, loader, ttl)
+        """获取缓存（sentinel_as 见 MultiLevelCache.get，MLC-08）"""
+        return self._cache.get(key, loader, ttl, sentinel_as=sentinel_as)
     
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """设置缓存"""
@@ -1108,9 +1252,9 @@ class CacheManager:
         """根据模式删除"""
         return self._cache.delete_pattern(pattern)
     
-    def clear(self) -> None:
-        """清空缓存"""
-        self._cache.clear()
+    def clear(self, patterns: Optional[List[str]] = None) -> int:
+        """清空缓存（L2 按模式删除，见 MultiLevelCache.clear）"""
+        return self._cache.clear(patterns)
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计"""
@@ -1123,6 +1267,10 @@ class CacheManager:
     def disable(self) -> None:
         """禁用缓存"""
         self._cache.disable()
+    
+    def is_enabled(self) -> bool:
+        """检查是否启用（透传 MultiLevelCache，此前缺失导致库测试失败）"""
+        return self._cache.is_enabled()
     
     @classmethod
     def get_instance(cls) -> "CacheManager":

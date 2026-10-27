@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multilevel-cache"
-version = "1.1.1"
+version = "1.2.0"
 description = "一个可复用的多级缓存Python模块，支持L1内存缓存、L2 Redis缓存和L3数据库回源"
 readme = "README.md"
 license = {text = "MIT"}

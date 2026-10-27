@@ -6,6 +6,7 @@ import hashlib
 import logging
 import threading
 import time
+import uuid as uuid_module
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -82,21 +83,32 @@ class DistributedLock:
         self._acquired = False
     
     def _generate_identifier(self) -> str:
-        """生成锁标识"""
-        return hashlib.md5(
-            f"{time.time()}-{threading.current_thread().ident}".encode()
-        ).hexdigest()
+        """生成锁标识（uuid4，避免跨进程 time+tid 相同导致误删他人锁）"""
+        return uuid_module.uuid4().hex
     
     def acquire(self) -> bool:
         """获取锁"""
         try:
-            result = self.redis_client.set(
-                self.lock_key,
-                self.identifier,
-                ttl=self.timeout,
-                nx=True
-            )
-            
+            # MLC-04: 必须走原生 redis 客户端做 SET NX EX。库内 RedisCache.set()
+            # 签名为 (key, value, ttl)，不接收 nx —— 原实现 `set(..., nx=True)`
+            # 每次必抛 TypeError 被吞掉，锁永远获取不到（或永远走降级）。
+            client = getattr(self.redis_client, "client", None)
+            if client is not None:
+                result = client.set(
+                    self.lock_key,
+                    self.identifier,
+                    ex=self.timeout,
+                    nx=True,
+                )
+            else:
+                # 兼容恰好实现了 (key, value, ttl, nx) 签名的注入实现
+                result = self.redis_client.set(
+                    self.lock_key,
+                    self.identifier,
+                    ttl=self.timeout,
+                    nx=True
+                )
+
             if result:
                 self._acquired = True
                 logger.debug(f"获取锁成功: {self.lock_key}")
@@ -305,8 +317,24 @@ class RateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
     
+    # MLC-14: 原子滑窗——清理过期成员后先计数, 仅当未超限才写入本次请求。
+    # 原 pipeline 先 zadd 后判定, 被拒绝的请求同样计入窗口,
+    # 持续超限场景下计数单调膨胀、对合法请求逐渐"过紧"。
+    # KEYS[1]=限流键 ARGV[1]=window_start ARGV[2]=max_requests
+    # ARGV[3]=member(唯一, 由调用方带 uuid 避免同刻碰撞) ARGV[4]=score ARGV[5]=window TTL
+    _LUA_SLIDING_WINDOW = """
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+    local count = redis.call('ZCARD', KEYS[1])
+    if count < tonumber(ARGV[2]) then
+        redis.call('ZADD', KEYS[1], ARGV[4], ARGV[3])
+        redis.call('EXPIRE', KEYS[1], ARGV[5])
+        return 1
+    end
+    return 0
+    """
+
     def is_allowed(self, identifier: str = "default") -> bool:
-        """检查是否允许请求"""
+        """检查是否允许请求（仅放行的请求计入窗口）"""
         try:
             current_time = time.time()
             window_start = current_time - self.window_seconds
@@ -314,18 +342,13 @@ class RateLimiter:
             key = f"{self.key}:{identifier}"
             
             if hasattr(self.redis_client, 'client') and self.redis_client.client:
-                with self.redis_client.client.get_connection() as conn:
-                    pipe = conn.pipeline()
-                    
-                    pipe.zremrangebyscore(key, 0, window_start)
-                    pipe.zcard(key)
-                    pipe.zadd(key, {str(current_time): current_time})
-                    pipe.expire(key, self.window_seconds)
-                    
-                    results = pipe.execute()
-                    current_count = results[1]
-                    
-                    return current_count < self.max_requests
+                # member 附加 uuid: 纯时间戳在时钟粒度粗的平台上会互相覆盖丢样本
+                member = f"{current_time}:{uuid_module.uuid4().hex[:8]}"
+                return bool(self.redis_client.client.eval(
+                    self._LUA_SLIDING_WINDOW, 1, key,
+                    window_start, self.max_requests,
+                    member, current_time, self.window_seconds,
+                ))
             
             return True
             

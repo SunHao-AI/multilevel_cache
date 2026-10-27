@@ -23,7 +23,9 @@ class IntegratedCacheConfig:
     l2_ttl: int = 1800
     
     # MQ同步配置
-    enable_mq_sync: bool = True
+    # MLC-13: 默认关闭。原 True 使实例化即尝试连 MQ，无 MQ 环境白吃连接超时，
+    # 且叠加静默失效形成"默认开启但永久失效"组合。需要跨节点失效请显式开启。
+    enable_mq_sync: bool = False
     mq_host: str = "localhost"
     mq_port: int = 5672
     mq_user: str = "guest"
