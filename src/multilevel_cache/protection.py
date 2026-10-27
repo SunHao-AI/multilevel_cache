@@ -365,10 +365,12 @@ class RateLimiter:
             key = f"{self.key}:{identifier}"
             
             if hasattr(self.redis_client, 'client') and self.redis_client.client:
-                with self.redis_client.client.get_connection() as conn:
-                    conn.zremrangebyscore(key, 0, window_start)
-                    current_count = conn.zcard(key)
-                    return max(0, self.max_requests - current_count)
+                # 注: 原实现走 client.get_connection() 拿到的是底层 Connection 对象
+                # (无 zcard/zremrangebyscore 方法), 异常被下方 except 吞掉、
+                # 恒回落 max_requests; redis.Redis 本身即命令客户端, 直接调用。
+                self.redis_client.client.zremrangebyscore(key, 0, window_start)
+                current_count = self.redis_client.client.zcard(key)
+                return max(0, self.max_requests - current_count)
             
             return self.max_requests
             

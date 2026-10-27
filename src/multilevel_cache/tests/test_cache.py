@@ -5,6 +5,7 @@
 import pytest
 import time
 import threading
+import uuid
 from unittest.mock import Mock, patch, MagicMock
 
 from multilevel_cache.config import (
@@ -390,38 +391,44 @@ class TestCacheMonitor:
 
 class TestCachedDecorator:
     """缓存装饰器测试"""
-    
+
     def test_cached_decorator(self):
-        """测试缓存装饰器"""
+        """测试缓存装饰器
+
+        key_prefix 带 uuid: 固定前缀直连真实 Redis 时, TTL 内重跑会被
+        上次残留键命中导致 call_count 断言失败(非幂等), 唯一前缀保证可重复运行。
+        """
         call_count = 0
-        
-        @cached(key_prefix="test", ttl=60)
+        prefix = f"test:{uuid.uuid4().hex[:8]}"
+
+        @cached(key_prefix=prefix, ttl=60)
         def expensive_function(x):
             nonlocal call_count
             call_count += 1
             return x * 2
-        
+
         result1 = expensive_function(5)
         result2 = expensive_function(5)
-        
+
         assert result1 == 10
         assert result2 == 10
         assert call_count == 1
-    
+
     def test_cached_with_different_args(self):
-        """测试不同参数的缓存"""
+        """测试不同参数的缓存(唯一 key_prefix, 同上加幂等)"""
         call_count = 0
-        
-        @cached(key_prefix="test")
+        prefix = f"test:{uuid.uuid4().hex[:8]}"
+
+        @cached(key_prefix=prefix)
         def func(x):
             nonlocal call_count
             call_count += 1
             return x
-        
+
         func(1)
         func(2)
         func(1)
-        
+
         assert call_count == 2
 
 
